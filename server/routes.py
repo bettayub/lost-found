@@ -1,11 +1,15 @@
 from flask import Flask ,request
 from flask_sqlalchemy import SQLAlchemy
 from flask_restx import Api, Namespace, Resource, fields
-from models import User, db , Item , Reward
+from models import User, db , Item , Reward , Claim
 from flask_migrate import Migrate
+from flask_cors import CORS
 import secrets
 from flask_jwt_extended import JWTManager
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
+from functools import wraps
+from jwt.exceptions import ExpiredSignatureError, DecodeError
+import jwt
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -20,6 +24,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Initialize SQLAlchemy
 db.init_app(app)
 
+CORS(app)
 # Initialize Flask-Migrate
 migrate = Migrate(app, db)
 
@@ -93,11 +98,16 @@ pending_item_schema = api.model('lostitem' ,{
     'item_description': fields.String(description='Description of the item'),
     'status' : fields.String ,
 })
+claim_item_schema = ns.model('claimeditem',{
+    'item_name': fields.String ,
+    'user_id': fields.Integer,
+    'status': fields.String         
+})
+# ------------------------------------------authentication---------------------------------------------------------
 
 
 
 
-# ------------------------------------------------------------END OF ROUTES---------------------------------------
 
 # Define API routes
 @ns.route('/users')
@@ -107,21 +117,6 @@ class Users(Resource):
         users = User.query.all()
         return users, 200
     
-@ns.route('/delete_users/<int:user_id>')
-class DeleteUser(Resource):
-    @ns.doc(params={'user_id': 'ID of the user to be deleted'})
-    @ns.marshal_list_with(users_schema)
-    def delete(self, user_id):
-        user = User.query.get(user_id)
-
-        if user:
-            db.session.delete(user)
-            db.session.commit()
-            return {'message': f'User with ID {user_id} deleted successfully'}, 200
-        else:
-            return {'message': f'User with ID {user_id} not found'}, 404
-
-  
 @ns.route('/signup')
 class Signup(Resource):
     @ns.expect(user_input_schema)
@@ -174,7 +169,8 @@ class Login(Resource):
         access_token = create_access_token(identity=user.id)
         return {
             'access_token': access_token ,
-            'username' : user.username
+            'username' : user.username ,
+            'role' : user.role
         } , 201
         
 @ns.route('/itemlost')
@@ -213,41 +209,7 @@ class PostItemlost(Resource):
                 "message": "Failed to create a lostitem",
                 "error": str(e)
             }, 500
-            
-            
-            
-@ns.route('/delete_delivered_items/<int:item_id>')
-class ItemResource(Resource):
-    @ns.doc(params={'item_id': 'ID of the item to be deleted'})
-    @ns.marshal_with(lost_item_schema)
-    def delete(self, item_id):
-        item = Item.query.get(item_id)
 
-        if item:
-            # Check if the item status is 'delivered'
-            if item.status == 'delivered':
-                db.session.delete(item)
-                db.session.commit()
-                return {'message': f'Item with ID {item_id} deleted successfully'}, 200
-            else:
-                return {'message': f'Item with ID {item_id} cannot be deleted. Status is not "delivered".'}, 400
-        else:
-            return {'message': f'Item with ID {item_id} not found'}, 404           
-            
-
-@ns.route('/delete_all_items/<int:item_id>')
-class ItemResourceAll(Resource):
-    @ns.doc(params={'item_id': 'ID of the item to be deleted'})
-    @ns.marshal_with(lost_item_schema)
-    def delete(self, item_id):
-        item = Item.query.get(item_id)
-
-        if item:
-            db.session.delete(item)
-            db.session.commit()
-            return {'message': f'Item with ID {item_id} deleted successfully'}, 200
-        else:
-            return {'message': f'Item with ID {item_id} not found'}, 404
 
 @ns.route('/lostitems')
 class Users(Resource):
@@ -266,6 +228,8 @@ class RewardsResource(Resource):
         rewards = Reward.query.all()
         return rewards , 201
     
+
+    #-------------------------------------------reportfounditemlogic----------------------------------------------------------- 
 @ns.route('/reportfounditem')
 class Reportfounditem(Resource):
     @ns.expect(reportfound_item_schema)
@@ -324,6 +288,87 @@ class ApproveFoundItem(Resource):
             return {"message": "Found item approved by admin"}, 200
         else:
             return {"error": "Item not found or not in 'pending' status"}, 404
+        
+@ns.route('/found_items')
+class get_pending_items(Resource):
+    
+    @ns.marshal_list_with(reportfound_item_schema)
+    def get(self):
+     found_items = Item.query.filter_by(status='found').all()
+     if found_items:
+        return found_items
+     else:
+        return {'message': 'No found items'}, 200
+     
+   
+@ns.route('/lostitems/<int:id>')
+class Deletetransaction(Resource):   
+    def delete(self ,id):
+        transaction = Item.query.filter_by(id=id).first()
+        db.session.delete(transaction)
+        db.session.commit()
+
+        response_dict = {
+            "message" : "record succefully deleted"
+        }
+        return response_dict, 200
+    
+
+    
+# -----------------------------------------------------claim logic---------------------------------------------------------------
+@ns.route('/claimitem')
+class Claimfounditem(Resource):
+    @ns.expect(claim_item_schema)
+    def post(self):
+        try:
+            data = request.json  # Get the JSON data from the request
+
+            new_claimeditem = Claim(
+                item_name=data.get('item_name'),
+                user_id=data.get('user_id'),
+                status= 'notclaimed',
+            )
+
+            db.session.add(new_claimeditem)
+            db.session.commit()
+
+            return {
+                "message": "Item claimed. Awaiting admin approval.",
+                "founditem": {
+                    "item_iname": new_claimeditem.item_name,
+                    "user_id": new_claimeditem.user_id,
+                    'status': new_claimeditem.status
+                }
+            }, 201
+
+        except Exception as e:
+            db.session.rollback()
+            return {
+                "message": "Failed to claim item",
+                "error": str(e)
+            }, 500
+        
+@ns.route('/approve_claimed_item/<int:item_id>')
+class ApproveClaimedItem(Resource):
+    def put(self, item_id):
+        claim_item = Claim.query.get(item_id)
+
+        if claim_item and claim_item.status == 'notclaimed':
+            claim_item.status = 'claimed'
+            db.session.commit()
+            return {"message": "Claimed item approved by admin"}, 200
+        else:
+            return {"error": "Item not claimed "}, 404
+        
+@ns.route('/pendingclaim_items')
+class get_pending_items(Resource):
+    @ns.marshal_list_with(claim_item_schema)
+    def get(self):
+     pending_items = Claim.query.filter_by(status='notclaimed').all()
+     if pending_items:
+        return pending_items
+     else:
+        return {'message': 'No pending items'}, 200
 
 # Main entry point
 if __name__ == '__main__':
